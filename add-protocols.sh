@@ -22,6 +22,7 @@ SELFSTEAL_SOCK=/dev/shm/nginx.sock
 DRY_RUN=${DRY_RUN:-0}
 REALITY=""
 CERT_DIR=""
+CERT_MOUNT=""
 
 PROTOS=(tcp_reality tcp_tls xhttp_reality xhttp_tls hy2 grpc_reality grpc_tls)
 declare -A NAME=(
@@ -217,20 +218,23 @@ prepare_reality() {
     log_ok "Сгенерированы новые Reality-ключи"
 }
 
-# Ищет lineage Let's Encrypt, чей серт покрывает домен (у eGamesAPI бывает wildcard или суффикс -0001).
+# Ищет серт, покрывающий домен: certbot (wildcard, суффикс -0001) или загруженный eGamesAPI в /opt/remnanode/ssl.
 prepare_cert() {
     local p need=0 f
     for p in "${SELECTED[@]}"; do is_tls "$p" && need=1; done
     (( need )) || return 0
     CERT_DIR=""
-    for f in /etc/letsencrypt/live/*/fullchain.pem; do
-        [[ -f $f ]] || continue
+    for f in /etc/letsencrypt/live/*/fullchain.pem /opt/remnanode/ssl/*/fullchain.pem; do
+        [[ -f $f && -f ${f%/*}/privkey.pem ]] || continue
         openssl x509 -in "$f" -noout -checkend 0 &>/dev/null || continue
-        openssl x509 -in "$f" -noout -checkhost "$DOMAIN" 2>/dev/null | grep -q 'does match' && { CERT_DIR=$(dirname "$f"); break; }
+        openssl x509 -in "$f" -noout -checkhost "$DOMAIN" 2>/dev/null | grep -q 'does match' && { CERT_DIR=${f%/*}; break; }
     done
     if [[ -z $CERT_DIR ]]; then
         CERT_DIR=$(ask "Не найден серт для $DOMAIN. Папка с fullchain.pem/privkey.pem" "/etc/letsencrypt/live/$DOMAIN")
     fi
+    [[ -f $CERT_DIR/fullchain.pem && -f $CERT_DIR/privkey.pem ]] || fatal "Нет fullchain.pem/privkey.pem в $CERT_DIR"
+    # Монтируем корень certbot целиком: симлинки live/*.pem, смонтированные по одному, после renew протухают.
+    [[ $CERT_DIR == /etc/letsencrypt/* ]] && CERT_MOUNT=/etc/letsencrypt || CERT_MOUNT=${CERT_DIR%/*}
     log_ok "Сертификат: $CERT_DIR"
 }
 
@@ -269,25 +273,35 @@ build_inbound() {
     fi
 }
 
-# Монтирует /etc/letsencrypt целиком: симлинки live/*.pem, смонтированные по одному, после renew протухают.
+# Bind-источник, которого нет на хосте, docker создаст пустой папкой — нода не поднимется.
+check_compose_paths() {
+    local src bad=0
+    while read -r src; do
+        [[ $src == ./* ]] && src=/opt/remnanode/${src#./}
+        [[ -e $src ]] || { log_err "В $COMPOSE путь не существует: $src"; bad=1; }
+    done < <(sed -nE 's|^[[:space:]]*- (\.?/[^:]+):.*|\1|p' "$COMPOSE")
+    (( bad == 0 )) || fatal "Исправьте volumes в $COMPOSE" "Удалите или поправьте строки с несуществующими путями и запустите скрипт снова"
+}
+
 prepare_node() {
     local p need=0 hook=/etc/letsencrypt/renewal-hooks/deploy/restart-remnanode.sh
     for p in "${SELECTED[@]}"; do is_tls "$p" && need=1; done
     (( need && ON_NODE )) || return 0
-    [[ -f $COMPOSE ]] || fatal "Нет $COMPOSE" "Добавьте в volumes remnanode: - /etc/letsencrypt:/etc/letsencrypt:ro"
-    if grep -q '/etc/letsencrypt:/etc/letsencrypt' "$COMPOSE"; then
-        log_ok "/etc/letsencrypt уже смонтирован в remnanode"
+    [[ -f $COMPOSE ]] || fatal "Нет $COMPOSE" "Добавьте в volumes remnanode: - $CERT_MOUNT:$CERT_MOUNT:ro"
+    if grep -qF -- "- $CERT_MOUNT:$CERT_MOUNT" "$COMPOSE"; then
+        log_ok "$CERT_MOUNT уже смонтирован в remnanode"
     else
+        check_compose_paths
         cp "$COMPOSE" "$COMPOSE.bak"
-        sed -i -E 's|^([[:space:]]*)- /var/log/remnanode:/var/log/remnanode$|&\n\1- /etc/letsencrypt:/etc/letsencrypt:ro|' "$COMPOSE"
-        grep -q '/etc/letsencrypt:/etc/letsencrypt' "$COMPOSE" ||
-            fatal "Не удалось добавить volume в $COMPOSE" "Добавьте вручную в volumes remnanode: - /etc/letsencrypt:/etc/letsencrypt:ro"
+        sed -i -E "s|^([[:space:]]*)- /var/log/remnanode:/var/log/remnanode\$|&\n\1- $CERT_MOUNT:$CERT_MOUNT:ro|" "$COMPOSE"
+        grep -qF -- "- $CERT_MOUNT:$CERT_MOUNT" "$COMPOSE" ||
+            fatal "Не удалось добавить volume в $COMPOSE" "Добавьте вручную в volumes remnanode: - $CERT_MOUNT:$CERT_MOUNT:ro"
         log_info "Пересоздаю remnanode..."
         (cd /opt/remnanode && docker compose up -d remnanode) >/dev/null 2>&1 ||
             fatal "docker compose up не прошёл" "Бэкап: $COMPOSE.bak"
-        log_ok "Volume /etc/letsencrypt добавлен (бэкап: $COMPOSE.bak)"
+        log_ok "Volume $CERT_MOUNT добавлен (бэкап: $COMPOSE.bak)"
     fi
-    if [[ ! -f $hook ]]; then
+    if [[ $CERT_MOUNT == /etc/letsencrypt && ! -f $hook ]]; then
         mkdir -p "$(dirname "$hook")"
         printf '#!/bin/sh\ndocker restart remnanode\n' >"$hook" && chmod +x "$hook"
         log_ok "Хук перезапуска ноды после renew: $hook"

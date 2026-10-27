@@ -62,9 +62,9 @@ DRY_RUN=1 RW_URL=https://panel.example.com bash <(curl -Ls https://raw.githubuse
 
 **On the node** (only when a TLS protocol or Hysteria2 is selected):
 
-- Finds the Let's Encrypt certificate that covers the node domain, wildcards included.
-- Adds the `/etc/letsencrypt:/etc/letsencrypt:ro` volume to `/opt/remnanode/docker-compose.yml` and recreates `remnanode`. Backup: `docker-compose.yml.bak`.
-- Creates the `/etc/letsencrypt/renewal-hooks/deploy/restart-remnanode.sh` hook, which restarts the node after the certificate renews.
+- Finds the certificate that covers the node domain (wildcards included) in `/etc/letsencrypt/live/` or `/opt/remnanode/ssl/` (where eGamesAPI puts it).
+- Mounts the certificate folder into `remnanode` (`/etc/letsencrypt` or `/opt/remnanode/ssl`) and recreates the container. Backup: `docker-compose.yml.bak`. It first checks that every volume path exists, because Docker would create empty folders in place of missing ones.
+- For certbot certificates, creates the `/etc/letsencrypt/renewal-hooks/deploy/restart-remnanode.sh` hook, which restarts the node after the certificate renews.
 - Opens the ports in UFW if it is active.
 
 ## Requirements
